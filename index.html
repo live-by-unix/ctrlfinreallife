@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Real life ctrl+f</title>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <style>
+        :root { --neon: #00ff41; --danger: #ff003c; --bg: #050505; }
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; background: var(--bg); font-family: 'Courier New', monospace; overflow: hidden; color: var(--neon); }
+        #v { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; }
+        #overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
+        .hud { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column; pointer-events: none; padding: 20px; }
+        .top-ui { pointer-events: auto; display: flex; flex-direction: column; gap: 10px; }
+        input { background: rgba(0,0,0,0.8); border: 2px solid var(--neon); color: var(--neon); padding: 15px; font-size: 22px; outline: none; box-shadow: 0 0 15px rgba(0,255,65,0.3); }
+        .controls { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; gap: 20px; pointer-events: auto; }
+        .btn { background: rgba(0,0,0,0.7); border: 1px solid var(--neon); color: var(--neon); padding: 15px; border-radius: 50%; cursor: pointer; width: 60px; height: 60px; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+        .btn:active { background: var(--neon); color: black; }
+        .telemetry-grid { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; font-size: 10px; gap: 5px; opacity: 0.8; }
+        #scanner-bar { position: absolute; width: 100%; height: 2px; background: var(--neon); box-shadow: 0 0 20px var(--neon); z-index: 4; top: 0; }
+        .match-alert { position: absolute; top: 30%; left: 50%; transform: translate(-50%, -50%); font-size: 40px; font-weight: bold; color: var(--danger); text-shadow: 0 0 20px var(--danger); display: none; z-index: 10; border: 4px solid var(--danger); padding: 10px 30px; background: rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+
+    <video id="v" autoplay playsinline></video>
+    <canvas id="overlay"></canvas>
+    <div id="scanner-bar"></div>
+    <div id="alert" class="match-alert">TARGET LOCKED</div>
+
+    <div class="hud">
+        <div class="top-ui">
+            <input type="text" id="q" placeholder="ENTER TARGET ID (e.g. SALT)..." spellcheck="false">
+            <div id="status">INIT NEURAL SCHEDULER...</div>
+        </div>
+
+        <div class="controls">
+            <div class="btn" onclick="toggleTorch()">🔦</div>
+            <div class="btn" onclick="adjustZoom(0.5)">+</div>
+            <div class="btn" onclick="adjustZoom(-0.5)">-</div>
+        </div>
+
+        <div class="telemetry-grid">
+            <div>CORES: <span id="cores">0</span></div>
+            <div>FPS: <span id="fps">0</span></div>
+            <div>THREADS: ACTIVE</div>
+            <div>MEM: STABLE</div>
+        </div>
+    </div>
+
+    <script>
+        const v = document.getElementById('v');
+        const c = document.getElementById('overlay');
+        const ctx = c.getContext('2d');
+        const q = document.getElementById('q');
+        const s = document.getElementById('status');
+        const alertBox = document.getElementById('alert');
+        
+        let scheduler, track;
+        let zoomLevel = 1;
+        let isBusy = false;
+        let lastScan = Date.now();
+
+        async function init() {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
+            });
+            v.srcObject = stream;
+            track = stream.getVideoTracks()[0];
+
+            scheduler = Tesseract.createScheduler();
+            const workerCount = navigator.hardwareConcurrency || 4;
+            document.getElementById('cores').innerText = workerCount;
+
+            for(let i=0; i<workerCount; i++) {
+                const w = await Tesseract.createWorker('eng');
+                scheduler.addWorker(w);
+            }
+
+            s.innerText = "ALL SYSTEMS NOMINAL";
+            animateScanner();
+            loop();
+        }
+
+        async function toggleTorch() {
+            if(track && track.getCapabilities().torch) {
+                const current = track.getSettings().torch;
+                await track.applyConstraints({ advanced: [{ torch: !current }] });
+            }
+        }
+
+        async function adjustZoom(val) {
+            if(track && track.getCapabilities().zoom) {
+                zoomLevel = Math.max(1, Math.min(track.getCapabilities().zoom.max, zoomLevel + val));
+                await track.applyConstraints({ advanced: [{ zoom: zoomLevel }] });
+            }
+        }
+
+        function animateScanner() {
+            const bar = document.getElementById('scanner-bar');
+            let pos = 0;
+            setInterval(() => {
+                pos = (pos + 1) % 100;
+                bar.style.top = pos + '%';
+            }, 20);
+        }
+
+        async function loop() {
+            if(!isBusy && q.value.length > 2) {
+                isBusy = true;
+                const now = Date.now();
+                document.getElementById('fps').innerText = Math.round(1000 / (now - lastScan));
+                lastScan = now;
+
+                const { data } = await scheduler.addJob('recognize', v);
+                handleResults(data.words);
+                isBusy = false;
+            }
+            requestAnimationFrame(loop);
+        }
+
+        function handleResults(words) {
+            c.width = v.clientWidth;
+            c.height = v.clientHeight;
+            const sx = c.width / v.videoWidth;
+            const sy = c.height / v.videoHeight;
+            ctx.clearRect(0, 0, c.width, c.height);
+            
+            let found = false;
+            const target = q.value.toLowerCase();
+
+            words.forEach(word => {
+                if(word.text.toLowerCase().includes(target)) {
+                    found = true;
+                    const b = word.bbox;
+                    ctx.strokeStyle = '#ff003c';
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(b.x0 * sx, b.y0 * sy, (b.x1 - b.x0) * sx, (b.y1 - b.y0) * sy);
+                    
+                    ctx.fillStyle = 'rgba(255, 0, 60, 0.3)';
+                    ctx.fillRect(b.x0 * sx, b.y0 * sy, (b.x1 - b.x0) * sx, (b.y1 - b.y0) * sy);
+                    
+                    if(navigator.vibrate) navigator.vibrate(200);
+                }
+            });
+
+            alertBox.style.display = found ? 'block' : 'none';
+        }
+
+        init().catch(e => s.innerText = "CRITICAL ERROR: " + e.message);
+    </script>
+</body>
+</html>
